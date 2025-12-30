@@ -1,0 +1,74 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: timeros-app
+    ports:
+      - "8000:8000"
+    environment:
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=timeros
+      - MYSQL_PASSWORD=timeros_password
+      - MYSQL_DATABASE=timeros
+      - DEBUG=False
+      - LOG_LEVEL=INFO
+    env_file:
+      - .env
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - timeros-network
+
+  mysql:
+    image: mysql:8.0
+    container_name: timeros-mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=root_password
+      - MYSQL_DATABASE=timeros
+      - MYSQL_USER=timeros
+      - MYSQL_PASSWORD=timeros_password
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_general_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot_password"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - timeros-network
+
+  # Redis (可选，用于任务队列)
+  redis:
+    image: redis:7-alpine
+    container_name: timeros-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - timeros-network
+    profiles:
+      - queue
+
+volumes:
+  mysql_data:
+  redis_data:
+
+networks:
+  timeros-network:
+    driver: bridge
+
