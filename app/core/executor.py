@@ -1,24 +1,28 @@
 """
 任务执行引擎模块。
 
-该模块负责执行各种类型的任务，包括研究任务、分析任务、报告任务等。
-根据任务类型调用相应的处理器，处理任务执行过程中的错误，并保存执行结果。
+该模块负责执行各种类型的任务，使用LangGraph Agent自主决策使用哪些工具。
+Agent会根据任务描述自动选择合适的工具来完成任务。
 """
 
 import json
 import time
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.tools import BaseTool
 from sqlalchemy.orm import Session
 
-from app.ai_providers.base import BaseAIProvider
+from app.agents.task_agent import TaskAgent
 from app.core.database import get_db
 from app.core.models import Task, TaskExecution
-from app.tools.data_analyzer import DataAnalyzer
-from app.tools.email_client import EmailClient
-from app.tools.notion_client import NotionClient
-from app.tools.web_search import WebSearchTool
+from app.tools.langchain_tools import (
+    get_all_tools,
+    get_analysis_tools,
+    get_report_tools,
+    get_research_tools,
+)
 from app.utils.exceptions import TaskExecutionError
 from app.utils.logger import get_logger
 
@@ -29,44 +33,138 @@ class TaskExecutor:
     """
     任务执行引擎类。
 
-    负责执行各种类型的任务，包括：
+    使用LangGraph Agent自主决策执行任务，Agent会根据任务描述
+    自动选择合适的工具来完成任务。
+
+    支持的任务类型：
     - 研究任务：搜索信息、生成摘要
     - 分析任务：分析数据、生成报告
     - 报告任务：生成报告并发布
-
-    支持错误处理、重试机制、结果保存等功能。
     """
 
     def __init__(
         self,
-        ai_provider: BaseAIProvider,
-        web_search: Optional[WebSearchTool] = None,
-        email_client: Optional[EmailClient] = None,
-        notion_client: Optional[NotionClient] = None,
-        data_analyzer: Optional[DataAnalyzer] = None,
+        llm: BaseChatModel,
+        tools: Optional[List[BaseTool]] = None,
     ):
         """
         初始化任务执行引擎。
 
         Args:
-            ai_provider: AI服务提供商，用于生成文本、分析等
-            web_search: 网络搜索工具，用于研究任务
-            email_client: 邮件客户端，用于发送通知
-            notion_client: Notion客户端，用于发布报告
-            data_analyzer: 数据分析工具，用于分析任务
+            llm: LangChain Chat模型实例
+            tools: 可用的工具列表，如果为None则使用所有工具
         """
-        self.ai_provider = ai_provider
-        self.web_search = web_search or WebSearchTool()
-        self.email_client = email_client or EmailClient()
-        self.notion_client = notion_client or NotionClient()
-        self.data_analyzer = data_analyzer or DataAnalyzer()
+        self.llm = llm
+        self.tools = tools or get_all_tools()
 
-    async def execute_task(self, task_id: int, db: Optional[Session] = None) -> Dict[str, Any]:
+        # 创建Agent实例
+        self.agent = TaskAgent(llm=llm, tools=self.tools)
+
+        logger.info(f"TaskExecutor初始化完成，可用工具数量: {len(self.tools)}")
+
+    def _get_tools_for_task_type(self, task_type: str) -> List[BaseTool]:
+        """
+        根据任务类型获取相关工具。
+
+        Args:
+            task_type: 任务类型
+
+        Returns:
+            工具列表
+        """
+        if task_type == "research_task":
+            return get_research_tools()
+        elif task_type == "analysis_task":
+            return get_analysis_tools()
+        elif task_type == "report_task":
+            return get_report_tools()
+        else:
+            return get_all_tools()
+
+    def _build_task_prompt(self, task: Task) -> str:
+        """
+        构建任务执行的提示词。
+
+        根据任务类型和参数构建详细的执行指令。
+
+        Args:
+            task: 任务对象
+
+        Returns:
+            任务执行提示词
+        """
+        params = task.params or {}
+        task_type = task.task_type
+
+        # 基础提示
+        prompt_parts = [
+            f"请执行以下任务：",
+            f"",
+            f"任务名称: {task.name}",
+            f"任务描述: {task.description}",
+            f"任务类型: {task_type}",
+        ]
+
+        # 添加任务参数
+        if params:
+            prompt_parts.append(f"任务参数: {json.dumps(params, ensure_ascii=False)}")
+
+        # 根据任务类型添加具体指令
+        if task_type == "research_task":
+            topic = params.get("topic", "相关主题")
+            time_range = params.get("time_range", "24小时")
+            prompt_parts.extend([
+                "",
+                "执行要求：",
+                f"1. 搜索关于 '{topic}' 的最新信息（时间范围：{time_range}）",
+                "2. 分析搜索结果，提取关键信息",
+                "3. 生成一份简洁的摘要报告，包含主要发现和关键信息",
+            ])
+            if params.get("send_email"):
+                email_addresses = params.get("email_addresses", [])
+                if email_addresses:
+                    prompt_parts.append(
+                        f"4. 将结果通过邮件发送到: {', '.join(email_addresses)}"
+                    )
+
+        elif task_type == "analysis_task":
+            target = params.get("target", "数据")
+            count = params.get("count", 5)
+            prompt_parts.extend([
+                "",
+                "执行要求：",
+                f"1. 分析目标: {target}",
+                f"2. 分析数量: {count}",
+                "3. 生成详细的分析报告，包含关键发现和建议",
+            ])
+
+        elif task_type == "report_task":
+            report_type = params.get("report_type", "报告")
+            prompt_parts.extend([
+                "",
+                "执行要求：",
+                f"1. 生成{report_type}",
+                "2. 报告应包含：执行摘要、关键指标、趋势分析、结论和建议",
+            ])
+            if params.get("publish_to_notion"):
+                database_id = params.get("notion_database_id", "")
+                if database_id:
+                    prompt_parts.append(f"3. 将报告发布到Notion数据库: {database_id}")
+
+        prompt_parts.extend([
+            "",
+            "请使用可用的工具完成上述任务，并提供详细的执行结果。",
+        ])
+
+        return "\n".join(prompt_parts)
+
+    async def execute_task(
+        self, task_id: int, db: Optional[Session] = None
+    ) -> Dict[str, Any]:
         """
         执行任务。
 
-        根据任务类型调用相应的处理器，处理执行过程中的错误，
-        并保存执行结果到数据库。
+        使用LangGraph Agent自主决策执行任务，并保存执行结果到数据库。
 
         Args:
             task_id: 任务ID
@@ -82,6 +180,10 @@ class TaskExecutor:
         if db is None:
             db_gen = get_db()
             db = next(db_gen)
+
+        execution = None
+        task = None
+        start_time = time.time()
 
         try:
             # 查询任务
@@ -107,51 +209,67 @@ class TaskExecutor:
             db.add(execution)
             db.commit()
 
-            # 记录开始时间
-            start_time = time.time()
+            # 构建任务提示词
+            task_prompt = self._build_task_prompt(task)
 
-            # 根据任务类型执行相应的处理逻辑
-            if task.task_type == "research_task":
-                result = await self._execute_research_task(task, db)
-            elif task.task_type == "analysis_task":
-                result = await self._execute_analysis_task(task, db)
-            elif task.task_type == "report_task":
-                result = await self._execute_report_task(task, db)
-            else:
-                raise TaskExecutionError(f"未知的任务类型: {task.task_type}")
+            # 根据任务类型选择工具（可选，也可以使用所有工具让Agent自己选择）
+            task_tools = self._get_tools_for_task_type(task.task_type)
+
+            # 创建针对此任务的Agent（使用特定工具集）
+            task_agent = TaskAgent(llm=self.llm, tools=task_tools)
+
+            # 执行任务
+            agent_result = await task_agent.execute(
+                task_description=task_prompt,
+                task_params=task.params,
+            )
 
             # 计算执行耗时
             duration = time.time() - start_time
 
-            # 更新执行记录
-            execution.status = "completed"
-            execution.result = json.dumps(result, ensure_ascii=False)
-            execution.duration_seconds = duration
-            db.commit()
+            # 处理执行结果
+            if agent_result.get("success"):
+                # 构建结果
+                result = {
+                    "task_type": task.task_type,
+                    "agent_response": agent_result.get("final_response", ""),
+                    "message_count": agent_result.get("message_count", 0),
+                }
 
-            # 更新任务状态
-            if task.is_recurring:
-                # 周期性任务保持pending状态，等待下次执行
-                task.status = "pending"
+                # 更新执行记录
+                execution.status = "completed"
+                execution.result = json.dumps(result, ensure_ascii=False)
+                execution.duration_seconds = duration
+                db.commit()
+
+                # 更新任务状态
+                if task.is_recurring:
+                    task.status = "pending"
+                else:
+                    task.status = "completed"
+                db.commit()
+
+                logger.info(
+                    f"任务执行成功: task_id={task_id}, duration={duration:.2f}s",
+                    extra={"task_id": task_id, "duration": duration},
+                )
+
+                return {
+                    "status": "completed",
+                    "result": result,
+                    "duration_seconds": duration,
+                }
+
             else:
-                # 一次性任务标记为completed
-                task.status = "completed"
-            db.commit()
-
-            logger.info(
-                f"任务执行成功: task_id={task_id}, duration={duration:.2f}s",
-                extra={"task_id": task_id, "duration": duration},
-            )
-
-            return {
-                "status": "completed",
-                "result": result,
-                "duration_seconds": duration,
-            }
+                # 执行失败
+                error_message = agent_result.get("error", "未知错误")
+                raise TaskExecutionError(f"Agent执行失败: {error_message}")
 
         except Exception as e:
             # 处理执行错误
             error_message = str(e)
+            duration = time.time() - start_time
+
             logger.error(
                 f"任务执行失败: task_id={task_id}, error={error_message}",
                 extra={"task_id": task_id, "error": error_message},
@@ -159,260 +277,53 @@ class TaskExecutor:
             )
 
             # 更新执行记录
-            if "execution" in locals():
+            if execution is not None:
                 execution.status = "failed"
                 execution.error_message = error_message
-                execution.duration_seconds = time.time() - start_time
+                execution.duration_seconds = duration
                 db.commit()
 
             # 更新任务状态
-            if "task" in locals():
+            if task is not None:
                 task.status = "failed"
                 db.commit()
 
             raise TaskExecutionError(f"任务执行失败: {error_message}") from e
 
-    async def _execute_research_task(
-        self, task: Task, db: Session
-    ) -> Dict[str, Any]:
+    async def execute_task_with_streaming(
+        self, task_id: int, db: Optional[Session] = None
+    ):
         """
-        执行研究任务。
+        流式执行任务。
 
-        研究任务通常包括：
-        1. 使用网络搜索工具搜索相关信息
-        2. 使用AI分析搜索结果
-        3. 生成摘要
-        4. 发送结果（如需要）
+        支持实时返回执行过程中的状态更新。
 
         Args:
-            task: 任务对象
+            task_id: 任务ID
             db: 数据库会话
 
-        Returns:
-            执行结果字典
+        Yields:
+            执行过程中的状态更新
         """
-        logger.debug(f"执行研究任务: task_id={task.id}")
+        if db is None:
+            db_gen = get_db()
+            db = next(db_gen)
 
-        # 获取任务参数
-        params = task.params or {}
-        topic = params.get("topic", "AI新闻")
-        time_range = params.get("time_range", "24小时")
+        try:
+            task = db.query(Task).filter(Task.id == task_id).first()
+            if not task:
+                yield {"error": f"任务不存在: task_id={task_id}"}
+                return
 
-        # 步骤1: 搜索相关信息
-        search_query = f"{topic} {time_range}"
-        search_results = await self.web_search.search_news(
-            query=search_query, time_range="24h", num_results=10
-        )
+            # 构建任务提示词
+            task_prompt = self._build_task_prompt(task)
 
-        if not search_results:
-            return {"message": "未找到相关信息", "results": []}
+            # 使用流式执行
+            async for event in self.agent.stream_execute(
+                task_description=task_prompt,
+                task_params=task.params,
+            ):
+                yield event
 
-        # 步骤2: 使用AI生成摘要
-        # 构建prompt
-        results_text = "\n".join(
-            [
-                f"{i+1}. {r['title']}\n   {r['snippet']}\n   {r['link']}"
-                for i, r in enumerate(search_results[:5])
-            ]
-        )
-
-        prompt = f"""
-请分析以下搜索结果，生成一份简洁的摘要报告。
-
-搜索结果：
-{results_text}
-
-请生成一份包含以下内容的摘要：
-1. 主要发现（3-5个要点）
-2. 关键信息总结
-3. 相关链接
-
-请用中文回答，保持简洁明了。
-"""
-
-        summary = await self.ai_provider.generate_text(
-            prompt=prompt, temperature=0.7, max_tokens=1000
-        )
-
-        # 步骤3: 构建结果
-        result = {
-            "topic": topic,
-            "time_range": time_range,
-            "search_results_count": len(search_results),
-            "summary": summary,
-            "sources": [
-                {"title": r["title"], "link": r["link"]} for r in search_results[:5]
-            ],
-        }
-
-        # 步骤4: 如果任务参数中指定了发送邮件，则发送
-        if params.get("send_email"):
-            email_addresses = params.get("email_addresses", [])
-            if email_addresses:
-                try:
-                    self.email_client.send_task_result(
-                        to_addresses=email_addresses,
-                        task_name=task.name,
-                        result=summary,
-                        is_success=True,
-                    )
-                except Exception as e:
-                    logger.warning(f"发送邮件失败: {str(e)}")
-
-        return result
-
-    async def _execute_analysis_task(
-        self, task: Task, db: Session
-    ) -> Dict[str, Any]:
-        """
-        执行分析任务。
-
-        分析任务通常包括：
-        1. 收集数据
-        2. 使用数据分析工具分析
-        3. 使用AI生成分析报告
-        4. 发布结果（如需要）
-
-        Args:
-            task: 任务对象
-            db: 数据库会话
-
-        Returns:
-            执行结果字典
-        """
-        logger.debug(f"执行分析任务: task_id={task.id}")
-
-        # 获取任务参数
-        params = task.params or {}
-        target = params.get("target", "数据")
-        count = params.get("count", 5)
-
-        # 步骤1: 收集数据（这里简化处理，实际应该从数据源获取）
-        # 例如：从数据库、API等获取数据
-        data = []  # 这里应该是实际的数据
-
-        # 步骤2: 分析数据
-        if data:
-            analysis_result = self.data_analyzer.analyze_data(data)
-            summary = self.data_analyzer.generate_summary(data)
-        else:
-            analysis_result = {}
-            summary = "暂无数据可分析"
-
-        # 步骤3: 使用AI生成分析报告
-        prompt = f"""
-请基于以下分析结果，生成一份详细的分析报告。
-
-分析目标: {target}
-分析数量: {count}
-
-分析结果:
-{json.dumps(analysis_result, ensure_ascii=False, indent=2)}
-
-数据摘要:
-{summary}
-
-请生成一份包含以下内容的分析报告：
-1. 执行摘要
-2. 关键发现
-3. 详细分析
-4. 建议和结论
-
-请用中文回答，保持专业和详细。
-"""
-
-        report = await self.ai_provider.generate_text(
-            prompt=prompt, temperature=0.7, max_tokens=2000
-        )
-
-        # 步骤4: 构建结果
-        result = {
-            "target": target,
-            "count": count,
-            "analysis": analysis_result,
-            "summary": summary,
-            "report": report,
-        }
-
-        return result
-
-    async def _execute_report_task(self, task: Task, db: Session) -> Dict[str, Any]:
-        """
-        执行报告任务。
-
-        报告任务通常包括：
-        1. 收集数据
-        2. 使用AI生成报告
-        3. 发布到Notion或其他平台
-
-        Args:
-            task: 任务对象
-            db: 数据库会话
-
-        Returns:
-            执行结果字典
-        """
-        logger.debug(f"执行报告任务: task_id={task.id}")
-
-        # 获取任务参数
-        params = task.params or {}
-        report_type = params.get("report_type", "流量分析")
-
-        # 步骤1: 收集数据（这里简化处理）
-        # 实际应该从数据源获取，如网站流量数据
-        data = {}
-
-        # 步骤2: 使用AI生成报告
-        prompt = f"""
-请基于以下数据，生成一份详细的{report_type}报告。
-
-数据类型: {report_type}
-数据内容: {json.dumps(data, ensure_ascii=False, indent=2) if data else "暂无数据"}
-
-请生成一份包含以下内容的报告：
-1. 执行摘要
-2. 关键指标
-3. 趋势分析
-4. 结论和建议
-
-请用中文回答，保持专业和详细。
-"""
-
-        report = await self.ai_provider.generate_text(
-            prompt=prompt, temperature=0.7, max_tokens=2000
-        )
-
-        # 步骤3: 发布到Notion（如果配置了）
-        notion_page_id = None
-        if params.get("publish_to_notion"):
-            database_id = params.get("notion_database_id")
-            if database_id:
-                try:
-                    notion_result = await self.notion_client.create_page(
-                        database_id=database_id,
-                        title=f"{report_type}报告 - {datetime.utcnow().strftime('%Y-%m-%d')}",
-                        content={
-                            "报告内容": {
-                                "rich_text": [
-                                    {
-                                        "text": {
-                                            "content": report[:2000],  # Notion限制
-                                        }
-                                    }
-                                ]
-                            }
-                        },
-                    )
-                    notion_page_id = notion_result.get("id")
-                except Exception as e:
-                    logger.warning(f"发布到Notion失败: {str(e)}")
-
-        # 步骤4: 构建结果
-        result = {
-            "report_type": report_type,
-            "report": report,
-            "notion_page_id": notion_page_id,
-        }
-
-        return result
-
+        except Exception as e:
+            yield {"error": str(e)}

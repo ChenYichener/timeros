@@ -1,160 +1,198 @@
 # AI服务提供商模块
 
+> **注意**: 此模块已被LangChain替代。请使用 `app.llm` 和 `app.agents` 模块。
+
 ## 1. 模块概述
 
-### 1.1 模块职责
+### 1.1 新架构说明
 
-AI服务提供商模块提供统一的AI服务接口，支持多种AI服务提供商：
+从 v2.0 开始，项目已迁移到 LangChain 1.0 生态系统。新的模块结构如下：
 
-- OpenAI (GPT-4, GPT-3.5)
-- Anthropic (Claude)
-- 本地模型 (Ollama等)
+- **LLM工厂**: `app/llm/factory.py` - 创建LangChain Chat模型
+- **Agent模块**: `app/agents/task_agent.py` - LangGraph自主决策Agent
+- **工具模块**: `app/tools/langchain_tools.py` - LangChain Tool格式的工具
 
-### 1.2 模块位置
+### 1.2 依赖关系
 
-- 基础类：`app/ai_providers/base.py`
-- OpenAI实现：`app/ai_providers/openai_provider.py`
-- Anthropic实现：`app/ai_providers/anthropic_provider.py`
-- 本地模型实现：`app/ai_providers/local_provider.py`
+新依赖：
+- `langchain-core`: LangChain核心组件
+- `langchain-openai`: OpenAI集成
+- `langchain-anthropic`: Anthropic集成
+- `langchain-community`: 社区集成（Ollama等）
+- `langgraph`: Agent编排框架
 
-### 1.3 依赖关系
+## 2. 新API文档
 
-- `openai`: OpenAI官方SDK
-- `anthropic`: Anthropic官方SDK
-- `httpx`: HTTP客户端（本地模型使用）
+### 2.1 LLM工厂 (`app/llm/factory.py`)
 
-## 2. API文档
+#### get_chat_model()
 
-### 2.1 类/函数列表
-
-- `BaseAIProvider`: AI提供商基类
-- `OpenAIProvider`: OpenAI提供商实现
-- `AnthropicProvider`: Anthropic提供商实现
-- `LocalProvider`: 本地模型提供商实现
-
-### 2.2 详细API说明
-
-#### BaseAIProvider
-
-AI服务提供商基类，定义统一接口。
-
-**方法列表**:
-
-- `async chat_completion(messages, model, temperature, max_tokens, **kwargs) -> str`: 对话补全
-- `async generate_text(prompt, model, temperature, max_tokens, **kwargs) -> str`: 生成文本
-
-#### OpenAIProvider
-
-OpenAI服务提供商实现。
-
-**示例**:
+获取LangChain Chat模型实例。
 
 ```python
-from app.ai_providers.openai_provider import OpenAIProvider
+from app.llm.factory import get_chat_model
 
-provider = OpenAIProvider(api_key="your-api-key")
-result = await provider.generate_text("请分析以下内容...")
+# 使用默认配置
+llm = get_chat_model()
+
+# 指定提供商和模型
+llm = get_chat_model(
+    provider="openai",
+    model="gpt-4",
+    temperature=0.7
+)
 ```
 
-#### AnthropicProvider
+**参数**:
+- `provider`: AI提供商 ("openai", "anthropic", "local")
+- `model`: 模型名称
+- `temperature`: 温度参数 (0-1)
 
-Anthropic服务提供商实现。
+**返回**: `BaseChatModel` 实例
 
-**示例**:
+### 2.2 任务Agent (`app/agents/task_agent.py`)
+
+#### TaskAgent类
+
+使用LangGraph实现的自主决策Agent。
 
 ```python
-from app.ai_providers.anthropic_provider import AnthropicProvider
+from app.agents.task_agent import TaskAgent
+from app.llm.factory import get_chat_model
+from app.tools.langchain_tools import get_all_tools
 
-provider = AnthropicProvider(api_key="your-api-key")
-result = await provider.generate_text("请分析以下内容...")
+llm = get_chat_model()
+agent = TaskAgent(llm=llm, tools=get_all_tools())
+
+# 执行任务
+result = await agent.execute(
+    task_description="搜索最新的AI新闻并生成摘要",
+    task_params={"topic": "AI新闻", "time_range": "24小时"}
+)
 ```
 
-#### LocalProvider
+**方法**:
+- `execute(task_description, task_params)`: 执行任务
+- `stream_execute(task_description, task_params)`: 流式执行任务
 
-本地模型服务提供商实现。
+### 2.3 LangChain工具 (`app/tools/langchain_tools.py`)
 
-**示例**:
+可用工具列表：
+- `web_search`: 网络搜索
+- `search_news`: 新闻搜索
+- `send_email`: 发送邮件
+- `send_task_result_email`: 发送任务结果邮件
+- `create_notion_page`: 创建Notion页面
+- `update_notion_page`: 更新Notion页面
+- `analyze_data`: 数据分析
+- `generate_data_summary`: 生成数据摘要
 
 ```python
-from app.ai_providers.local_provider import LocalProvider
+from app.tools.langchain_tools import get_all_tools, get_research_tools
 
-provider = LocalProvider(base_url="http://localhost:11434", default_model="llama2")
-result = await provider.generate_text("请分析以下内容...")
+# 获取所有工具
+all_tools = get_all_tools()
+
+# 获取研究任务相关工具
+research_tools = get_research_tools()
 ```
 
 ## 3. 设计说明
 
-### 3.1 设计思路
-
-采用策略模式和适配器模式：
-
-- 定义统一的`BaseAIProvider`接口
-- 各提供商实现统一接口
-- 可以方便地切换不同的AI服务
-
-### 3.2 关键流程
+### 3.1 架构图
 
 ```
-调用请求 → 统一接口 → 具体提供商实现 → API调用 → 返回结果
+┌──────────────────────────────────────────────────────────┐
+│                    API Layer (FastAPI)                    │
+└────────────────────────────┬─────────────────────────────┘
+                             │
+┌────────────────────────────▼─────────────────────────────┐
+│                    TaskParser                             │
+│         (使用LangChain结构化输出解析任务)                  │
+└────────────────────────────┬─────────────────────────────┘
+                             │
+┌────────────────────────────▼─────────────────────────────┐
+│                    TaskExecutor                           │
+│              (调用LangGraph Agent)                        │
+└────────────────────────────┬─────────────────────────────┘
+                             │
+┌────────────────────────────▼─────────────────────────────┐
+│                    LangGraph Agent                        │
+│   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐  │
+│   │  LLM Node   │◄──►│  Tool Node  │◄──►│   Tools     │  │
+│   └─────────────┘    └─────────────┘    └─────────────┘  │
+└──────────────────────────────────────────────────────────┘
 ```
+
+### 3.2 工作流程
+
+1. **任务解析**: 使用 `TaskParser` 解析自然语言描述
+2. **Agent调用**: `TaskExecutor` 创建并调用 `TaskAgent`
+3. **自主决策**: Agent根据任务描述自主选择工具
+4. **工具执行**: 调用相应的LangChain工具
+5. **结果返回**: Agent汇总结果并返回
 
 ## 4. 配置说明
 
 ### 4.1 环境变量
 
-- `OPENAI_API_KEY`: OpenAI API密钥
-- `ANTHROPIC_API_KEY`: Anthropic API密钥
+```bash
+# AI提供商选择
+AI_PROVIDER=openai  # 可选: openai, anthropic, local
 
-### 4.2 配置文件
+# OpenAI配置
+OPENAI_API_KEY=your-api-key
+OPENAI_BASE_URL=https://api.openai.com/v1  # 可选，用于自定义端点
 
-无需额外配置文件，通过环境变量配置。
+# Anthropic配置
+ANTHROPIC_API_KEY=your-api-key
+```
 
-## 5. 使用示例
+## 5. 迁移指南
 
-### 5.1 使用OpenAI
+### 5.1 从旧版本迁移
 
+**旧代码**:
 ```python
 from app.ai_providers.openai_provider import OpenAIProvider
 
 provider = OpenAIProvider()
-result = await provider.chat_completion([
-    {"role": "user", "content": "请分析以下内容..."}
-])
+result = await provider.generate_text("请分析...")
 ```
 
-### 5.2 使用Anthropic
-
+**新代码**:
 ```python
-from app.ai_providers.anthropic_provider import AnthropicProvider
+from app.llm.factory import get_chat_model
+from langchain_core.messages import HumanMessage
 
-provider = AnthropicProvider()
-result = await provider.generate_text("请分析以下内容...")
+llm = get_chat_model()
+result = await llm.ainvoke([HumanMessage(content="请分析...")])
 ```
 
-### 5.3 使用本地模型
+### 5.2 使用Agent执行任务
 
+**旧方式**: 手动编排工具调用
+
+**新方式**: 让Agent自主决策
 ```python
-from app.ai_providers.local_provider import LocalProvider
+from app.agents.task_agent import TaskAgent
+from app.llm.factory import get_chat_model
 
-provider = LocalProvider(base_url="http://localhost:11434")
-result = await provider.generate_text("请分析以下内容...")
+agent = TaskAgent(llm=get_chat_model())
+result = await agent.execute("搜索AI新闻并生成摘要")
 ```
 
-## 6. 常见问题
+## 6. 已废弃的API
 
-### Q: 如何切换AI服务提供商？
+以下API已废弃，将在未来版本中移除：
 
-A: 修改`app/api/dependencies.py`中的`get_ai_provider()`函数，或通过环境变量控制。
-
-### Q: 支持哪些模型？
-
-A: OpenAI支持GPT-4、GPT-3.5等；Anthropic支持Claude 3等；本地模型取决于Ollama安装的模型。
-
-### Q: API调用失败怎么办？
-
-A: 检查API密钥是否正确，网络连接是否正常，查看日志了解详细错误。
+- `app.ai_providers.base.BaseAIProvider`
+- `app.ai_providers.openai_provider.OpenAIProvider`
+- `app.ai_providers.anthropic_provider.AnthropicProvider`
+- `app.ai_providers.local_provider.LocalProvider`
+- `app.api.dependencies.get_ai_provider()`
 
 ## 7. 更新日志
 
+- 2026-01-04: 迁移到LangChain 1.0，添加LangGraph Agent支持
 - 2024-01-15: 初始版本，支持OpenAI、Anthropic和本地模型
-

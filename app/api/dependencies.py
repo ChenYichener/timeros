@@ -2,85 +2,45 @@
 API依赖注入模块。
 
 定义FastAPI的依赖项，包括数据库会话、服务实例等。
+使用LangChain组件替代原有的自定义AI Provider。
 """
 
 from functools import lru_cache
 
-from sqlalchemy.orm import Session
+from langchain_core.language_models.chat_models import BaseChatModel
 
-from app.ai_providers.anthropic_provider import AnthropicProvider
-from app.ai_providers.base import BaseAIProvider
-from app.ai_providers.local_provider import LocalProvider
-from app.ai_providers.openai_provider import OpenAIProvider
+from app.agents.task_agent import TaskAgent
 from app.core.database import get_db
 from app.core.executor import TaskExecutor
 from app.core.scheduler import scheduler
 from app.core.task_parser import TaskParser
+from app.llm.factory import get_chat_model, get_default_chat_model
 from app.services.execution_service import ExecutionService
 from app.services.task_service import TaskService
-from config.settings import settings
+from app.tools.langchain_tools import get_all_tools
+from app.utils.logger import get_logger
 
-# 创建全局AI提供商实例
-# 根据配置选择使用哪个提供商
-_ai_provider: BaseAIProvider | None = None
+logger = get_logger(__name__)
+
+# 缓存的LLM实例
+_chat_model: BaseChatModel | None = None
 
 
-def get_ai_provider() -> BaseAIProvider:
+def get_llm() -> BaseChatModel:
     """
-    获取AI服务提供商实例。
+    获取LangChain Chat模型实例。
 
     根据配置选择使用OpenAI、Anthropic或本地模型。
     使用单例模式，确保整个应用使用同一个实例。
 
-    选择逻辑：
-    1. 如果明确指定了 AI_PROVIDER 配置，使用指定的提供商
-    2. 否则根据可用的API密钥自动选择（优先级：OpenAI > Anthropic > Local）
-
     Returns:
-        AI服务提供商实例
-
-    Raises:
-        ValueError: 当指定的提供商无效或缺少必要的API密钥时
+        LangChain BaseChatModel实例
     """
-    global _ai_provider
-    if _ai_provider is None:
-        provider_name = settings.AI_PROVIDER
-
-        # 如果明确指定了提供商
-        if provider_name:
-            provider_name = provider_name.lower().strip()
-            if provider_name == "openai":
-                if not settings.OPENAI_API_KEY:
-                    raise ValueError("已指定使用OpenAI，但未配置OPENAI_API_KEY")
-                _ai_provider = OpenAIProvider(
-                    api_key=settings.OPENAI_API_KEY,
-                    base_url=settings.OPENAI_BASE_URL,
-                )
-            elif provider_name == "anthropic":
-                if not settings.ANTHROPIC_API_KEY:
-                    raise ValueError("已指定使用Anthropic，但未配置ANTHROPIC_API_KEY")
-                _ai_provider = AnthropicProvider(api_key=settings.ANTHROPIC_API_KEY)
-            elif provider_name == "local":
-                _ai_provider = LocalProvider()
-            else:
-                raise ValueError(
-                    f"无效的AI提供商: {provider_name}。"
-                    f"支持的提供商: openai, anthropic, local"
-                )
-        else:
-            # 自动选择：根据可用的API密钥
-            if settings.OPENAI_API_KEY:
-                _ai_provider = OpenAIProvider(
-                    api_key=settings.OPENAI_API_KEY,
-                    base_url=settings.OPENAI_BASE_URL,
-                )
-            elif settings.ANTHROPIC_API_KEY:
-                _ai_provider = AnthropicProvider(api_key=settings.ANTHROPIC_API_KEY)
-            else:
-                # 默认使用本地模型
-                _ai_provider = LocalProvider()
-
-    return _ai_provider
+    global _chat_model
+    if _chat_model is None:
+        _chat_model = get_chat_model()
+        logger.info(f"初始化Chat模型: {type(_chat_model).__name__}")
+    return _chat_model
 
 
 @lru_cache()
@@ -93,8 +53,8 @@ def get_task_parser() -> TaskParser:
     Returns:
         任务解析器实例
     """
-    ai_provider = get_ai_provider()
-    return TaskParser(llm_provider=ai_provider)
+    llm = get_llm()
+    return TaskParser(llm=llm)
 
 
 @lru_cache()
@@ -107,8 +67,23 @@ def get_task_executor() -> TaskExecutor:
     Returns:
         任务执行器实例
     """
-    ai_provider = get_ai_provider()
-    return TaskExecutor(ai_provider=ai_provider)
+    llm = get_llm()
+    return TaskExecutor(llm=llm)
+
+
+@lru_cache()
+def get_task_agent() -> TaskAgent:
+    """
+    获取任务执行Agent实例。
+
+    使用缓存确保单例。
+
+    Returns:
+        TaskAgent实例
+    """
+    llm = get_llm()
+    tools = get_all_tools()
+    return TaskAgent(llm=llm, tools=tools)
 
 
 def get_task_service() -> TaskService:
@@ -150,3 +125,18 @@ async def execute_task_wrapper(task_id: int) -> None:
     finally:
         db.close()
 
+
+# 向后兼容：保留旧的函数名（已废弃）
+def get_ai_provider():
+    """
+    已废弃：请使用 get_llm() 替代。
+
+    此函数保留用于向后兼容，但建议迁移到新的LangChain接口。
+    """
+    import warnings
+    warnings.warn(
+        "get_ai_provider() 已废弃，请使用 get_llm() 替代",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return get_llm()
